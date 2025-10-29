@@ -169,64 +169,73 @@ def legend_modalidades_sisu(df_base: pd.DataFrame):
     )
     st.table(tab)
 
-def compute_course_kpis(df_base: pd.DataFrame, curso: str) -> dict:
-    """Calcula KPIs simples para um curso no df filtrado (pós-filtros-mestre)."""
+# --- NOVO: conjunto de status considerados ATIVOS ---
+ACTIVE_STATUSES = {"CURSANDO", "CANDIDATO FORMATURA", "FORMANDO"}  # incluo FORMANDO por segurança
+
+def compute_course_kpis_v2(df_base: pd.DataFrame, curso: str, ano_ref: int | None = None) -> dict:
+    """
+    KPIs conforme especificação:
+      • Ingresso%   = (# que ingressaram ANO_REF) / (# ATIVOS hoje) * 100
+      • Ocupação%   = (# ATIVOS hoje) / (soma de ingressos dos últimos 5 anos [ANO_REF..ANO_REF-4]) * 100
+      • Conclusão%  = (# CANDIDATO FORMATURA/FORMANDO) / (# ATIVOS hoje) * 100
+      • Evasão%     = (% dos que ingressaram ANO_REF e ANO_REF-1 que NÃO estão ativos)
+    Obs.: “hoje” = status atual no snapshot filtrado (após filtros-mestre do app).
+    """
     d = df_base[df_base["Curso"] == curso].copy()
     if d.empty:
-        return dict(ingresso_pct=np.nan, ocupacao_pct=np.nan, evasao_pct=np.nan, conclusao_pct=np.nan)
+        return dict(ano_ref=None, ingresso_pct=np.nan, ocupacao_pct=np.nan, conclusao_pct=np.nan, evasao_pct=np.nan)
 
-    # série de ingressantes 'Cursando' por ano
-    curs = d[d["Status"].str.upper() == "CURSANDO"]
-    by_year_curs = curs.groupby("Ingresso-Ano").size().reset_index(name="qtde")
+    # Ano de referência (default = último Ingresso-Ano disponível no curso)
+    anos = pd.to_numeric(d["Ingresso-Ano"], errors="coerce").dropna().astype(int)
+    if anos.empty:
+        return dict(ano_ref=None, ingresso_pct=np.nan, ocupacao_pct=np.nan, conclusao_pct=np.nan, evasao_pct=np.nan)
+    if ano_ref is None:
+        ano_ref = int(anos.max())
 
-    # Ingresso%: último ano / pico histórico
-    if not by_year_curs.empty:
-        ult_ano = by_year_curs["Ingresso-Ano"].max()
-        last = int(by_year_curs.loc[by_year_curs["Ingresso-Ano"] == ult_ano, "qtde"].sum())
-        peak = int(by_year_curs["qtde"].max())
-        ingresso_pct = (last / peak * 100) if peak > 0 else np.nan
+    # ATIVOS no snapshot (Cursando / Candidato Formatura / Formando)
+    status_upper = d["Status"].astype("string").str.upper()
+    ativos_mask = status_upper.isin(ACTIVE_STATUSES)
+    ativos_df = d[ativos_mask]
+    n_ativos = len(ativos_df)
+
+    # 1) Ingresso%
+    n_ing_ano = (pd.to_numeric(d["Ingresso-Ano"], errors="coerce").astype("Int64") == ano_ref).sum()
+    ingresso_pct = (n_ing_ano / n_ativos * 100) if n_ativos > 0 else np.nan
+
+    # 2) Ocupação%  (denom = soma de ingressantes últimos 5 anos: ano_ref..ano_ref-4)
+    janela5 = list(range(ano_ref - 4, ano_ref + 1))
+    n_ing_5 = d[pd.to_numeric(d["Ingresso-Ano"], errors="coerce").isin(janela5)].shape[0]
+    ocupacao_pct = (n_ativos / n_ing_5 * 100) if n_ing_5 > 0 else np.nan
+
+    # 3) Conclusão% (candidatos a formatura / ativos)
+    cand_form_mask = status_upper.isin({"CANDIDATO FORMATURA", "FORMANDO"})
+    n_cand_form = cand_form_mask.sum()
+    conclusao_pct = (n_cand_form / n_ativos * 100) if n_ativos > 0 else np.nan
+
+    # 4) Evasão% (coortes ano_ref e ano_ref-1 que NÃO estão ativos)
+    coorte_mask = pd.to_numeric(d["Ingresso-Ano"], errors="coerce").isin([ano_ref, ano_ref - 1])
+    coorte = d[coorte_mask].copy()
+    if len(coorte) > 0:
+        ev_non_active = ~coorte["Status"].astype("string").str.upper().isin(ACTIVE_STATUSES)
+        evasao_pct = (ev_non_active.sum() / len(coorte) * 100)
     else:
-        ingresso_pct = np.nan
-
-    # Ocupação geral%: Cursando / total do curso no filtro
-    total_curso = len(d)
-    cursando_total = (d["Status"].str.upper() == "CURSANDO").sum()
-    ocupacao_pct = (cursando_total / total_curso * 100) if total_curso > 0 else np.nan
-
-    # Conclusão%: Formado / total
-    formados = (d["Status"].str.upper() == "FORMADO").sum()
-    conclusao_pct = (formados / total_curso * 100) if total_curso > 0 else np.nan
-
-    # Evasão% (proxy): soma de status que indicam saída sem diploma
-    evasive_flags = d["Status"].str.upper().isin([
-        "CANCELADO",
-        "PERDA DE VAGA DESEMPENHO MÍNIMO",
-        "PERDA DE VAGA REMATRÍCULA",
-        "TRANSFERÊNCIA EXTERNA",
-        "TRANSFERÊNCIA INTERNA",
-        "JUBILADO",
-        "DESLIGADO",
-        # opcional: "FALECIDO"
-    ])
-    evasao = evasive_flags.sum()
-    evasao_pct = (evasao / total_curso * 100) if total_curso > 0 else np.nan
+        evasao_pct = np.nan
 
     return dict(
+        ano_ref=ano_ref,
         ingresso_pct=ingresso_pct,
         ocupacao_pct=ocupacao_pct,
+        conclusao_pct=conclusao_pct,
         evasao_pct=evasao_pct,
-        conclusao_pct=conclusao_pct
     )
 
-
 def moving_avg(df_counts: pd.DataFrame, win: int = 5) -> pd.DataFrame:
-    """Média móvel por ano (para 'EP ideal'). Espera colunas: Ingresso-Ano, qtde."""
+    """Média móvel para a série (EP ideal). Espera colunas: Ingresso-Ano, qtde."""
     if df_counts.empty:
         return df_counts
     g = df_counts.sort_values("Ingresso-Ano").copy()
-    g["ideal"] = g["qtde"].rolling(win, min_periods=1, center=False).mean()
+    g["ideal"] = g["qtde"].rolling(win, min_periods=1).mean()
     return g
-
 
 # SIDEBAR — upload de arquivo
 # ========== LOAD & PREP (via upload) ==========
@@ -705,31 +714,46 @@ elif page == "Análise de Cancelamentos":
 elif page == "Painel por Curso (KPIs + Cursando)":
     st.title("Painel por Curso — KPIs + Série de Cursando")
 
+    # Seleções
     curso_sel = st.selectbox("Curso", options=cursos, index=0)
-    janela = st.slider("Janela da média móvel para 'Curso ideal' (anos)", 1, 9, 5, step=1)
+    anos_curso = (
+        pd.to_numeric(f.loc[f["Curso"] == curso_sel, "Ingresso-Ano"], errors="coerce")
+        .dropna().astype(int).sort_values().unique().tolist()
+    )
+    if not anos_curso:
+        st.warning("Não há anos de ingresso válidos para este curso no filtro atual.")
+        st.stop()
 
-    # KPIs
-    k = compute_course_kpis(f, curso_sel)
+    colA, colB = st.columns([1, 1])
+    with colA:
+        ano_ref = st.selectbox("Ano de referência (para KPIs)", options=anos_curso, index=len(anos_curso)-1)
+    with colB:
+        janela = st.slider("Janela da média móvel para 'Curso ideal' (anos)", 1, 9, 5, step=1)
+
+    # KPIs (definições novas)
+    k = compute_course_kpis_v2(f, curso_sel, ano_ref=ano_ref)
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Ingresso", f"{k['ingresso_pct']:.1f}%" if pd.notna(k['ingresso_pct']) else "—")
-    c2.metric("Ocupação geral", f"{k['ocupacao_pct']:.1f}%" if pd.notna(k['ocupacao_pct']) else "—")
-    c3.metric("Evasão", f"{k['evasao_pct']:.1f}%" if pd.notna(k['evasao_pct']) else "—")
-    c4.metric("Conclusão", f"{k['conclusao_pct']:.1f}%" if pd.notna(k['conclusao_pct']) else "—")
+    c1.metric("Ingresso", f"{k['ingresso_pct']:.1f}%" if pd.notna(k['ingresso_pct']) else "—",
+              help="(# ingressantes no ano selecionado) ÷ (# ativos atuais)")
+    c2.metric("Ocupação geral", f"{k['ocupacao_pct']:.1f}%" if pd.notna(k['ocupacao_pct']) else "—",
+              help="# ativos atuais ÷ soma de ingressantes dos últimos 5 anos")
+    c3.metric("Conclusão", f"{k['conclusao_pct']:.1f}%" if pd.notna(k['conclusao_pct']) else "—",
+              help="# candidatos a formatura ÷ # ativos atuais")
+    c4.metric("Evasão", f"{k['evasao_pct']:.1f}%" if pd.notna(k['evasao_pct']) else "—",
+              help="% de ingressantes de (ano ref e ano ref–1) que NÃO estão ativos")
 
     st.markdown("#### Status dos estudantes — **Cursando por Ano de Ingresso**")
 
-    # Série 'Cursando' por ano
+    # Série 'Cursando' por ano (gráfico azul = atual; vermelho tracejado = ideal MM)
     df_curso = f[f["Curso"] == curso_sel].copy()
     g_cur = (
-        df_curso[df_curso["Status"].str.upper() == "CURSANDO"]
-        .groupby("Ingresso-Ano")
-        .size()
-        .reset_index(name="qtde")
-        .sort_values("Ingresso-Ano")
+        df_curso[df_curso["Status"].astype("string").str.upper() == "CURSANDO"]
+        .groupby("Ingresso-Ano").size()
+        .reset_index(name="qtde").sort_values("Ingresso-Ano")
     )
     g_cur = moving_avg(g_cur, win=janela)
 
-    # Chart: EP atual x EP ideal
     base = alt.Chart(g_cur).properties(height=420)
     linha_atual = base.mark_line(strokeWidth=2).encode(
         x=alt.X("Ingresso-Ano:Q", axis=alt.Axis(format="d"), title="Ano de Ingresso"),
@@ -747,24 +771,11 @@ elif page == "Painel por Curso (KPIs + Cursando)":
     )
     st.altair_chart((linha_atual + linha_ideal).interactive(), use_container_width=True)
 
-    # --- Se você tiver colunas de diversidade, mostre blocos (auto-hide se não existir) ---
-    has_genero = "genero" in f.columns.str.lower()
-    has_origem = any(col.lower() in ["origem", "escola_origem", "tipo_escola"] for col in f.columns)
-
-    if has_genero or has_origem:
-        st.markdown("#### Diversidade (amostra no filtro atual)")
-        if has_genero:
-            col_g = [c for c in f.columns if c.lower() == "genero"][0]
-            ggen = df_curso[col_g].value_counts(dropna=False, normalize=True).mul(100).round(1)
-            st.write("**Gênero**")
-            st.write(ggen.to_frame("%").T)
-        if has_origem:
-            col_o = [c for c in f.columns if c.lower() in ["origem", "escola_origem", "tipo_escola"]][0]
-            gori = df_curso[col_o].value_counts(dropna=False, normalize=True).mul(100).round(1)
-            st.write("**Origem escolar**")
-            st.write(gori.to_frame("%").T)
-
-    st.caption("Obs.: 'EP ideal' é a média móvel configurável sobre a série de Cursando por Ano de Ingresso.")
+    st.caption(
+        "Definições: Ativos = Cursando/Candidato a Formatura (incluído 'Formando' por compatibilidade). "
+        "Ocupação compara ativos com a soma de ingressantes dos últimos 5 anos; "
+        "Evasão observa coortes do ano de referência e do ano anterior."
+    )
 
 
 
