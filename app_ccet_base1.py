@@ -169,6 +169,65 @@ def legend_modalidades_sisu(df_base: pd.DataFrame):
     )
     st.table(tab)
 
+def compute_course_kpis(df_base: pd.DataFrame, curso: str) -> dict:
+    """Calcula KPIs simples para um curso no df filtrado (pós-filtros-mestre)."""
+    d = df_base[df_base["Curso"] == curso].copy()
+    if d.empty:
+        return dict(ingresso_pct=np.nan, ocupacao_pct=np.nan, evasao_pct=np.nan, conclusao_pct=np.nan)
+
+    # série de ingressantes 'Cursando' por ano
+    curs = d[d["Status"].str.upper() == "CURSANDO"]
+    by_year_curs = curs.groupby("Ingresso-Ano").size().reset_index(name="qtde")
+
+    # Ingresso%: último ano / pico histórico
+    if not by_year_curs.empty:
+        ult_ano = by_year_curs["Ingresso-Ano"].max()
+        last = int(by_year_curs.loc[by_year_curs["Ingresso-Ano"] == ult_ano, "qtde"].sum())
+        peak = int(by_year_curs["qtde"].max())
+        ingresso_pct = (last / peak * 100) if peak > 0 else np.nan
+    else:
+        ingresso_pct = np.nan
+
+    # Ocupação geral%: Cursando / total do curso no filtro
+    total_curso = len(d)
+    cursando_total = (d["Status"].str.upper() == "CURSANDO").sum()
+    ocupacao_pct = (cursando_total / total_curso * 100) if total_curso > 0 else np.nan
+
+    # Conclusão%: Formado / total
+    formados = (d["Status"].str.upper() == "FORMADO").sum()
+    conclusao_pct = (formados / total_curso * 100) if total_curso > 0 else np.nan
+
+    # Evasão% (proxy): soma de status que indicam saída sem diploma
+    evasive_flags = d["Status"].str.upper().isin([
+        "CANCELADO",
+        "PERDA DE VAGA DESEMPENHO MÍNIMO",
+        "PERDA DE VAGA REMATRÍCULA",
+        "TRANSFERÊNCIA EXTERNA",
+        "TRANSFERÊNCIA INTERNA",
+        "JUBILADO",
+        "DESLIGADO",
+        # opcional: "FALECIDO"
+    ])
+    evasao = evasive_flags.sum()
+    evasao_pct = (evasao / total_curso * 100) if total_curso > 0 else np.nan
+
+    return dict(
+        ingresso_pct=ingresso_pct,
+        ocupacao_pct=ocupacao_pct,
+        evasao_pct=evasao_pct,
+        conclusao_pct=conclusao_pct
+    )
+
+
+def moving_avg(df_counts: pd.DataFrame, win: int = 5) -> pd.DataFrame:
+    """Média móvel por ano (para 'EP ideal'). Espera colunas: Ingresso-Ano, qtde."""
+    if df_counts.empty:
+        return df_counts
+    g = df_counts.sort_values("Ingresso-Ano").copy()
+    g["ideal"] = g["qtde"].rolling(win, min_periods=1, center=False).mean()
+    return g
+
+
 # SIDEBAR — upload de arquivo
 # ========== LOAD & PREP (via upload) ==========
 
@@ -220,6 +279,7 @@ pages = [
     "Comparar 1 Status entre cursos",
     "Tempo ingresso–egresso (todos cursos)",
     "Análise de Cancelamentos",
+    "Painel por Curso (KPIs + Cursando)",
     "Informações & Créditos"
 ]
 page = st.sidebar.radio("Páginas", pages, index=0)
@@ -640,9 +700,78 @@ elif page == "Análise de Cancelamentos":
     legend_modalidades_sisu(df)
 
 # --------------------------
+# Painel por Curso (KPIs + série 'Cursando')
+# --------------------------
+elif page == "Painel por Curso (KPIs + Cursando)":
+    st.title("Painel por Curso — KPIs + Série de Cursando")
+
+    curso_sel = st.selectbox("Curso", options=cursos, index=0)
+    janela = st.slider("Janela da média móvel para 'Curso ideal' (anos)", 1, 9, 5, step=1)
+
+    # KPIs
+    k = compute_course_kpis(f, curso_sel)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Ingresso", f"{k['ingresso_pct']:.1f}%" if pd.notna(k['ingresso_pct']) else "—")
+    c2.metric("Ocupação geral", f"{k['ocupacao_pct']:.1f}%" if pd.notna(k['ocupacao_pct']) else "—")
+    c3.metric("Evasão", f"{k['evasao_pct']:.1f}%" if pd.notna(k['evasao_pct']) else "—")
+    c4.metric("Conclusão", f"{k['conclusao_pct']:.1f}%" if pd.notna(k['conclusao_pct']) else "—")
+
+    st.markdown("#### Status dos estudantes — **Cursando por Ano de Ingresso**")
+
+    # Série 'Cursando' por ano
+    df_curso = f[f["Curso"] == curso_sel].copy()
+    g_cur = (
+        df_curso[df_curso["Status"].str.upper() == "CURSANDO"]
+        .groupby("Ingresso-Ano")
+        .size()
+        .reset_index(name="qtde")
+        .sort_values("Ingresso-Ano")
+    )
+    g_cur = moving_avg(g_cur, win=janela)
+
+    # Chart: EP atual x EP ideal
+    base = alt.Chart(g_cur).properties(height=420)
+    linha_atual = base.mark_line(strokeWidth=2).encode(
+        x=alt.X("Ingresso-Ano:Q", axis=alt.Axis(format="d"), title="Ano de Ingresso"),
+        y=alt.Y("qtde:Q", title="Quantidade"),
+        color=alt.value("#4c78a8"),
+        tooltip=[alt.Tooltip("Ingresso-Ano:Q", title="Ano", format="d"),
+                 alt.Tooltip("qtde:Q", title="EP atual")]
+    )
+    linha_ideal = base.mark_line(strokeDash=[6,4], strokeWidth=2).encode(
+        x="Ingresso-Ano:Q",
+        y=alt.Y("ideal:Q", title=""),
+        color=alt.value("#e45756"),
+        tooltip=[alt.Tooltip("Ingresso-Ano:Q", title="Ano", format="d"),
+                 alt.Tooltip("ideal:Q", title="EP ideal (MM)")]
+    )
+    st.altair_chart((linha_atual + linha_ideal).interactive(), use_container_width=True)
+
+    # --- Se você tiver colunas de diversidade, mostre blocos (auto-hide se não existir) ---
+    has_genero = "genero" in f.columns.str.lower()
+    has_origem = any(col.lower() in ["origem", "escola_origem", "tipo_escola"] for col in f.columns)
+
+    if has_genero or has_origem:
+        st.markdown("#### Diversidade (amostra no filtro atual)")
+        if has_genero:
+            col_g = [c for c in f.columns if c.lower() == "genero"][0]
+            ggen = df_curso[col_g].value_counts(dropna=False, normalize=True).mul(100).round(1)
+            st.write("**Gênero**")
+            st.write(ggen.to_frame("%").T)
+        if has_origem:
+            col_o = [c for c in f.columns if c.lower() in ["origem", "escola_origem", "tipo_escola"]][0]
+            gori = df_curso[col_o].value_counts(dropna=False, normalize=True).mul(100).round(1)
+            st.write("**Origem escolar**")
+            st.write(gori.to_frame("%").T)
+
+    st.caption("Obs.: 'EP ideal' é a média móvel configurável sobre a série de Cursando por Ano de Ingresso.")
+
+
+
+# --------------------------
 # 9) Informações & Créditos
 # --------------------------
-elif page == pages[8]:
+elif page == "Informações & Créditos":
     st.title("ℹ️ Informações & Créditos")
     st.markdown("""
 **Origem dos Dados**

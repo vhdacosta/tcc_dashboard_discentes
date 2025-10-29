@@ -27,3 +27,4 @@ Dashboard para análise exploratória dos discentes do **CCET/UFSCar**, com foco
   9. **Informações & Créditos**
 
 ---
+Link live: https://vhdacosta-tcc-dashboard-discentes-app-ccet-base1-m9wwg8.streamlit.app/
